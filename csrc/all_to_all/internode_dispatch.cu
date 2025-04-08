@@ -74,7 +74,7 @@ __global__ __launch_bounds__(NUM_WARPS * 32, 1) void dispatchKernel(
     }
     __syncthreads();
 
-    if (warpId + 1 == NUM_WARPS) {
+    if (warpId + 1 == NUM_WARPS) { // If last warp
       // The experts are split across the available blocks.
       // The warp counts the number of tokens assigned to each expert.
       for (unsigned dstExpert = blockIdx.x * dpSize + dpRank; dstExpert < numExperts;
