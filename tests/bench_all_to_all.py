@@ -290,7 +290,6 @@ def _worker_bench_all_to_all(
     if pgi.rank == 0:
         outpath.parent.mkdir(parents=True, exist_ok=True)
         f_out = outpath.open("w")
-
         line = f"EP={pgi.world_size} DP={pgi.world_size // dp_size}"
         print(line)
         f_out.write(line + "\n")

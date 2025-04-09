@@ -1,3 +1,5 @@
+internode_dispatch.cu
+
 #include <cooperative_groups.h>
 #include <cuda.h>
 #include <nvshmem.h>
@@ -14,17 +16,17 @@ template <unsigned NUM_WARPS, bool DO_SEND, bool DO_RECV>
 __global__ __launch_bounds__(NUM_WARPS * 32, 1) void dispatchKernel(
     int32_t *outNumTokensPerExpert,
     size_t outNumTokensPerExpertStrideElem,
-    std::byte *expertX,
+    std::byte *expertX, // destination array for received tokens for a rank for token data
     size_t expertXStrideElem,
     size_t expertXStrideRow,
-    std::byte *expertXScale,
+    std::byte *expertXScale, // destination array for received tokens for a rank for token scale factors
     size_t expertXScaleStrideElem,
     size_t expertXScaleStrideRow,
-    std::byte *dpX,
+    std::byte *dpX, // source array to get tokens for a rank's token data to send off 
     size_t dpXStrideElem,
-    std::byte *dpXScale,
+    std::byte *dpXScale, // source array to get tokens for a rank's token scale factors to send off
     size_t dpXScaleStrideElem,
-    uint32_t *indices,
+    uint32_t *indices, // 
     size_t indicesStrideElem,
     size_t indicesStrideRow,
     size_t maxNumTokens,
@@ -331,3 +333,4 @@ void AllToAllInterNode::dispatch(
   }
   nvtxRangePop();
 }
+

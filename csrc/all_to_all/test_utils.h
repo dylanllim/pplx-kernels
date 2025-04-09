@@ -1,3 +1,5 @@
+test_utils.h
+
 #pragma once
 
 #include "core/buffer.h"
@@ -21,7 +23,7 @@ template <typename T> struct RankTestData {
   const size_t expertsPerToken;
   HostBuffer<T> x;
   HostBuffer<float> xScale;
-  HostBuffer<uint32_t> indices;
+  HostBuffer<uint32_t> indices; // Indices is length NUM_TOKENS * NUM_EXPERTS_PER_TOKEN
   HostBuffer<float> weights;
   HostBuffer<uint32_t> numRouted;
 
@@ -56,24 +58,38 @@ RankTestData<T>::RankTestData(
       indices(m * expertsPerToken),
       weights(m * expertsPerToken),
       numRouted(numExperts) {
-  std::uniform_int_distribution<> expert(0, numExperts - 1);
-
-  // Populate dummy routing information.
+  // Initialize routing counts for each expert to zero
   for (size_t i = 0; i < numExperts; ++i) {
     numRouted[i] = 0;
   }
 
+  // For each token
   for (size_t i = 0; i < m; ++i) {
+    // Create a vector containing all exert IDs
     std::vector<uint32_t> experts(numExperts);
     for (size_t j = 0; j < numExperts; ++j) {
       experts[j] = j;
     }
+    // Shuffle exper IDs randomly so each token gets a random ordering of experts
     std::shuffle(experts.begin(), experts.end(), gen);
+    // Create a random weight for each assignment
     std::uniform_real_distribution<> weight(0.0f, 1.0f);
+    // For current token, pick the first `expertsPerToken` experts
     for (size_t j = 0; j < expertsPerToken; ++j) {
+      // 'expert' is the j-th candidate from the shuffled list.
       uint32_t expert = experts[j];
+      // Update the routing count for that expert.
+      // 'loc' is the current count of tokens already routed to this expert
+      // (it gets incremented here; it could be used later to know which "slot" in a per-expert buffer to place data).
       uint32_t loc = numRouted[expert]++;
+      
+      // Record this expert's ID in the indices array for token i.
+      // The index in the array for token 'i' and assignment 'j' is: i * expertsPerToken + j.
       indices[i * expertsPerToken + j] = expert;
+      
+      // Weights here represet routing / gating values which are later 
+      // needed for combine phase to determine how much each expert will contribute 
+      // to final token representation 
       weights[i * expertsPerToken + j] = weight(gen);
     }
   }
@@ -88,7 +104,9 @@ RankTestData<T>::RankTestData(
     }
   } else {
     std::uniform_real_distribution<> value(-10.0f, 10.0f);
+    // For each token
     for (size_t i = 0; i < m; ++i) {
+      // For each value in feature vector
       for (size_t j = 0; j < hiddenDim; ++j) {
         x[i * hiddenDim + j] = value(gen);
       }

@@ -1,3 +1,5 @@
+test_all_to_all.cpp
+
 // All-to-all kernel test
 
 #include <cuda.h>
@@ -23,9 +25,9 @@ template <typename T, typename U, typename Kernel>
 bool testDispatchCombine(
     cudaStream_t stream,
     unsigned dpRank,
-    unsigned dpSize,
+    unsigned dpSize, // 2
     unsigned epRank,
-    unsigned epSize,
+    unsigned epSize, // World Size = 8
     uint32_t numExperts = 8,
     size_t expertsPerToken = 3,
     size_t hiddenDim = 16,
@@ -66,7 +68,7 @@ bool testDispatchCombine(
   auto &rank = rankTestData[dpRank];
   DeviceBuffer<T> xDevice(rank.x);
   DeviceBuffer<float> xScaleDevice(rank.xScale);
-  DeviceBuffer<uint32_t> indicesDevice(rank.indices);
+  DeviceBuffer<uint32_t> indicesDevice(rank.indices); // IndicesDevice is length NUM_TOKENS * NUM_EXPERTS_PER_TOKEN
   DeviceBuffer<float> weightsDevice(rank.weights);
 
   const unsigned expertsPerRank = numExperts / epSize;
@@ -105,7 +107,7 @@ bool testDispatchCombine(
       Strided1D<std::byte>(xDevice, hiddenDimBytes),
       Strided1D<std::byte>(xScaleDevice, hiddenDimScaleBytes),
       Strided2D<uint32_t>(indicesDevice, 1, expertsPerToken),
-      rank.m,
+      rank.m, // How many tokens a specific rank needs to send
       nullptr,
       SplitMode::NONE,
       stream
@@ -130,7 +132,7 @@ bool testDispatchCombine(
   HostBuffer<U> outTokensHost(outTokensDevice);
 
   // Print the results.
-  for (unsigned i = 0; i < epSize; ++i) {
+  for (unsigned i = 0; i < epSize; ++i) { 
     MPI_Barrier(MPI_COMM_WORLD);
 
     // Print per-expert results.
@@ -209,14 +211,18 @@ bool testDispatchCombine(
 
   // Verify the results.
   bool failed = false;
+  // For each GPU, check each expert that it owns 
   for (unsigned i = 0; i < epSize; ++i) {
     MPI_Barrier(MPI_COMM_WORLD);
 
-    for (size_t j = 0; j < expertsPerRank; ++j) {
-      const unsigned expert = epRank * expertsPerRank + j;
-      const auto indptr = outNumTokensPerExpertHost[j];
+    // For each expert in this GPU, check the tokens
+    for (size_t localExpertId = 0; localExpertId < expertsPerRank; ++localExpertId) {
+      const unsigned expert = epRank * expertsPerRank + localExpertId; // Calculate global expert ID 
+      // indptr is number of tokens that the kernel reports were sent to this expert
+      const auto indptr = outNumTokensPerExpertHost[localExpertId];
 
       const auto expectedIndptr = expectedExpertIndptr[expert];
+      // CHECK 1: Ensure that number of tokens received for expert is as expected
       if (!failed && indptr != expectedIndptr) {
         std::cerr << "expert_indptr[" << expert << "]:" << indptr << " != " << expectedIndptr
                   << std::endl;
@@ -224,9 +230,9 @@ bool testDispatchCombine(
         continue;
       }
 
-      unsigned token = 0;
-      size_t offset = j * maxNumTokens * numDPGroups;
-      size_t offsetScale = j * maxNumTokens * numDPGroups;
+      unsigned token = 0; // 
+      size_t offset = localExpertId * maxNumTokens * numDPGroups;
+      size_t offsetScale = localExpertId * maxNumTokens * numDPGroups;
       for (unsigned dp = 0; dp < numDPGroups; ++dp) {
         auto &rankData = rankTestData[dp];
 
