@@ -23,7 +23,7 @@ __global__ __launch_bounds__(NUM_WARPS * 32, 1) void dispatchKernel(
     size_t expertXScaleStrideElem,
     size_t expertXScaleStrideRow,
     std::byte *dpX, // source array to get tokens for a rank's token data to send off 
-    size_t dpXStrideElem,
+    size_t dpXStrideElem, // hiddenDim * sizeof() ==> Allows to access start of token data
     std::byte *dpXScale, // source array to get tokens for a rank's token scale factors to send off
     size_t dpXScaleStrideElem,
     uint32_t *indices, // 
@@ -44,15 +44,20 @@ __global__ __launch_bounds__(NUM_WARPS * 32, 1) void dispatchKernel(
     uint32_t *sourceIndex,
     uint32_t *sourceOffset,
     uint32_t *sourceGroup,
-    uint64_t *numTokensBuffer,
-    uint64_t *numRecvBuffer,
-    std::byte *xBufferIn,
-    std::byte *xBufferOut
+
+    // Buffer that holds outgoing token count signals
+    uint64_t *numTokensBuffer, // SIZE: numLocalExperts * numDPGroups
+    // Buffer that holds received token count signals
+    uint64_t *numRecvBuffer, // SIZE: numLocalExperts * numDPGroups
+    // Symmetric input buffer used to pack tokens before sending
+    std::byte *xBufferIn, // SIZE: maxNumTokens * perTokenBytes
+    // Output buffer where incoming tokens are written
+    std::byte *xBufferOut // SIZE: maxBatchTokens * perTokenBytes
 ) {
   // Determine the rank, DP rank and per-rank constants.
   const unsigned numLocalExperts = numExperts / worldSize;
-  const unsigned numDPGroups = worldSize / dpSize;
-  const unsigned dpGroup = rank / dpSize;
+  const unsigned numDPGroups = worldSize / dpSize; // 8 / 1 => 8
+  const unsigned dpGroup = rank / dpSize; // dpGroup = rank
   const unsigned dpRank = rank % dpSize;
   const unsigned tokenDim = hiddenDim + hiddenDimScale;
   const unsigned tokenStride =
@@ -70,6 +75,7 @@ __global__ __launch_bounds__(NUM_WARPS * 32, 1) void dispatchKernel(
 
   // Zero out the shared memory buffer.
   if constexpr (DO_SEND) {
+    // Each tokenIndex[expert] will hold the number of tokens processed for that expert
     extern __shared__ uint32_t tokenIndex[];
     for (uint32_t i = threadIdx.x; i < numExperts; i += blockDim.x) {
       tokenIndex[i] = 0;
@@ -77,8 +83,9 @@ __global__ __launch_bounds__(NUM_WARPS * 32, 1) void dispatchKernel(
     __syncthreads();
 
     if (warpId + 1 == NUM_WARPS) { // If last warp
-      // The experts are split across the available blocks.
-      // The warp counts the number of tokens assigned to each expert.
+      // Each block is responsible for some subset of experts... 
+      // The loop then iterates over destination experts that are assigned to this block
+      // The loop jumps by gridDim.x * x to cover all experts in round robin fashion
       for (unsigned dstExpert = blockIdx.x * dpSize + dpRank; dstExpert < numExperts;
            dstExpert += gridDim.x * dpSize) {
         const uint32_t dstRank = dstExpert / numLocalExperts;
@@ -86,7 +93,9 @@ __global__ __launch_bounds__(NUM_WARPS * 32, 1) void dispatchKernel(
 
         unsigned count = 0;
 
-#pragma unroll
+        // Each thread in the warp processes a subset of the total tokens for the current expert
+        // The indices array contains the expert assignments for each token
+        #pragma unroll
         for (uint32_t i = laneId; i < numTokens * numExpertsPerToken; i += WARP_SIZE) {
           unsigned expert = __ldg(&indices[i]);
           if (expert == dstExpert) {
@@ -94,6 +103,7 @@ __global__ __launch_bounds__(NUM_WARPS * 32, 1) void dispatchKernel(
           }
         }
 
+        // Perform warp level reduction to get total token count for this expert
         unsigned numTokensPerExpert = device::warp_sum(count);
         uint64_t *dstCount = &numTokensBuffer[dstLocalExpert * numDPGroups + dpGroup];
 
@@ -103,6 +113,7 @@ __global__ __launch_bounds__(NUM_WARPS * 32, 1) void dispatchKernel(
       }
 
       // Clear out some buffers.
+      // OPTIONAL: Ensure per-expert output count starts at 0
       if (blockIdx.x == 0) {
         for (uint32_t i = laneId; i < numLocalExperts; i += WARP_SIZE) {
           outNumTokensPerExpert[i] = 0;
@@ -112,13 +123,20 @@ __global__ __launch_bounds__(NUM_WARPS * 32, 1) void dispatchKernel(
       // Send the tokens to the destination ranks through RDMA.
       const unsigned numGroupWarps = NUM_WARPS - 1;
       const unsigned numGroupThreads = numGroupWarps * WARP_SIZE;
+      
+      // numTokens here is "m", which is random number between 0 and MAX_NUM_TOKENS
       for (unsigned i = 0; i < numTokens; i++) {
         // If the token is assigned to this block, handle it.
         if (i % (gridDim.x * dpSize) == (blockIdx.x * dpSize + dpRank)) {
           // Copy the token to the symmetric buffer.
+          // xBufferIn is symmetric input buffer where tokens are staged before sending 
           std::byte *xInPtr = xBufferIn + i * tokenStride;
           const int4 *srcX = (int4 *)(dpX + i * dpXStrideElem);
           const int4 *srcXScale = (int4 *)(dpXScale + i * dpXScaleStrideElem);
+          
+          // Each thread in warp group (NUM_WARPS - 1) copies a slice of tokens data
+          // Loop through token's data in units of int4 until complete tokenDim is copied 
+          // "tokenDim" here is "hiddenDim + hiddenDimScale"
           for (unsigned d = threadIdx.x; d * sizeof(int4) < tokenDim; d += numGroupThreads) {
             if (d * sizeof(int4) < hiddenDim) {
               ((int4 *)xInPtr)[d] = srcX[d];
@@ -126,21 +144,31 @@ __global__ __launch_bounds__(NUM_WARPS * 32, 1) void dispatchKernel(
               ((int4 *)xInPtr)[d] = srcXScale[d - hiddenDim / sizeof(int4)];
             }
           }
+          
+          // Have one thread (thread 0) store the token index in the symmetric buffer.
+          // This index is later used to track where the token originated.
           if (threadIdx.x == 0) {
             *((uint32_t *)(xInPtr + tokenDim)) = i;
           }
 
-          // Synchronize the warps within this warp group.
+          // Synchronize the warps within this warp group => Ensure copy is completed
           asm volatile("bar.sync 1, %0;" ::"r"(numGroupThreads));
 
           // Send the token to the other ranks, one send per warp.
+          // Each warp in the warp group sends the token based on a subset of destination assignments
           for (unsigned j = warpId; j < numExpertsPerToken; j += numGroupWarps) {
+            // Load destionation expert for this token 
             const uint32_t dstExpert = __ldg(&indices[i * numExpertsPerToken + j]);
+            // Compute which GPU the token is being sent to
             const uint32_t dstRank = dstExpert / numLocalExperts;
             const uint32_t dstLocalExpert = dstExpert % numLocalExperts;
 
+            // Retrieve current count of tokens sent to this expert
             const uint32_t index = tokenIndex[dstExpert];
+            // group = dstLocalExpert * 1 + rank
             const uint32_t group = dstLocalExpert * numDPGroups + dpGroup;
+            // Compute destination slot within remote's buffer
+            // Each group has a fixed capacity (maxNumTokens) 
             const unsigned loc = group * maxNumTokens + index;
 
             std::byte *destPointer = xBufferOut + loc * tokenStride;
@@ -151,12 +179,14 @@ __global__ __launch_bounds__(NUM_WARPS * 32, 1) void dispatchKernel(
                 &numRecvBuffer[group],
                 1,
                 NVSHMEM_SIGNAL_ADD,
-                dstRank
+                dstRank // Where token should be sent
             );
           }
         }
 
         // Replicate the token count calculation across all blocks.
+        // Need to update this such that for future tokens, can index into correct location
+        // in xBufferOut
         if (warpId == 0 && laneId < numExpertsPerToken) {
           uint32_t dstExpert = __ldg(&indices[i * numExpertsPerToken + laneId]);
           tokenIndex[dstExpert]++;

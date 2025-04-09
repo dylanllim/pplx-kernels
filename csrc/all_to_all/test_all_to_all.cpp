@@ -66,8 +66,8 @@ bool testDispatchCombine(
   }
 
   auto &rank = rankTestData[dpRank];
-  DeviceBuffer<T> xDevice(rank.x);
-  DeviceBuffer<float> xScaleDevice(rank.xScale);
+  DeviceBuffer<T> xDevice(rank.x); // xDevice is NUM_TOKENS * HIDDEN_DIM
+  DeviceBuffer<float> xScaleDevice(rank.xScale); // xScaleDevice is NUM_TOKENS * HIDDEN_DIM_SCALE
   DeviceBuffer<uint32_t> indicesDevice(rank.indices); // IndicesDevice is length NUM_TOKENS * NUM_EXPERTS_PER_TOKEN
   DeviceBuffer<float> weightsDevice(rank.weights);
 
