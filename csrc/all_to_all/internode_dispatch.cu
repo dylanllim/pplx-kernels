@@ -1,5 +1,3 @@
-internode_dispatch.cu
-
 #include <cooperative_groups.h>
 #include <cuda.h>
 #include <nvshmem.h>
@@ -10,266 +8,290 @@ internode_dispatch.cu
 #include "core/nvshmem_utils.h"
 #include "core/utils.h"
 
+#include "../../ThunderKittens/include/kittens.cuh"
+#include <cooperative_groups.h>
+
 using namespace pplx;
+using namespace kittens;
+namespace cg = cooperative_groups;
 
-template <unsigned NUM_WARPS, bool DO_SEND, bool DO_RECV>
-__global__ __launch_bounds__(NUM_WARPS * 32, 1) void dispatchKernel(
-    int32_t *outNumTokensPerExpert,
-    size_t outNumTokensPerExpertStrideElem,
-    std::byte *expertX, // destination array for received tokens for a rank for token data
-    size_t expertXStrideElem,
-    size_t expertXStrideRow,
-    std::byte *expertXScale, // destination array for received tokens for a rank for token scale factors
-    size_t expertXScaleStrideElem,
-    size_t expertXScaleStrideRow,
-    std::byte *dpX, // source array to get tokens for a rank's token data to send off 
-    size_t dpXStrideElem, // hiddenDim * sizeof() ==> Allows to access start of token data
-    std::byte *dpXScale, // source array to get tokens for a rank's token scale factors to send off
-    size_t dpXScaleStrideElem,
-    uint32_t *indices, // 
-    size_t indicesStrideElem,
-    size_t indicesStrideRow,
-    size_t maxNumTokens,
-    size_t numExperts,
-    unsigned rank,
-    unsigned worldSize,
-    unsigned dpSize,
-    size_t hiddenDim,
-    size_t hiddenDimScale,
-    size_t numExpertsPerToken,
-    unsigned *boundM,
-    unsigned m,
-    uint32_t *numTokensPerDP,
-    uint32_t *sourceExpert,
-    uint32_t *sourceIndex,
-    uint32_t *sourceOffset,
-    uint32_t *sourceGroup,
+constexpr int WORLD_SIZE = 8;
+constexpr int DP_SIZE = 1;
+constexpr int NUM_EXPERTS = 256;
 
-    // Buffer that holds outgoing token count signals
-    uint64_t *numTokensBuffer, // SIZE: numLocalExperts * numDPGroups
-    // Buffer that holds received token count signals
-    uint64_t *numRecvBuffer, // SIZE: numLocalExperts * numDPGroups
-    // Symmetric input buffer used to pack tokens before sending
-    std::byte *xBufferIn, // SIZE: maxNumTokens * perTokenBytes
-    // Output buffer where incoming tokens are written
-    std::byte *xBufferOut // SIZE: maxBatchTokens * perTokenBytes
-) {
-  // Determine the rank, DP rank and per-rank constants.
-  const unsigned numLocalExperts = numExperts / worldSize;
-  const unsigned numDPGroups = worldSize / dpSize; // 8 / 1 => 8
-  const unsigned dpGroup = rank / dpSize; // dpGroup = rank
-  const unsigned dpRank = rank % dpSize;
-  const unsigned tokenDim = hiddenDim + hiddenDimScale;
-  const unsigned tokenStride =
-      device::round_up<unsigned>(tokenDim + sizeof(uint32_t), sizeof(int4));
-  const unsigned WARP_SIZE = 32;
-  const unsigned warpId = threadIdx.x / WARP_SIZE;
-  const unsigned laneId = threadIdx.x % WARP_SIZE;
+constexpr int HIDDEN_DIM_SIZE = 7168;
+// Force HIDDEN_DIM_SCALE_SIZE to be multiple of 16
+constexpr int HIDDEN_DIM_SCALE_SIZE = 64; // HIDDEN_DIM_SIZE / BLOCK_SIZE => HIDDEN_DIM_SIZE / 128
+constexpr int TOKEN_DIM = HIDDEN_DIM_SIZE + HIDDEN_DIM_SCALE_SIZE;
 
-  // Determine the number of tokens populated which are to be sent.
-  const unsigned numTokens = boundM ? __ldg(boundM) : m;
-  ROSE_DEVICE_ASSERT(numTokens <= maxNumTokens);
-  ROSE_DEVICE_ASSERT(
-      hiddenDimScale == 0 || numTokens == 0 || (expertXScale != nullptr && dpXScale != nullptr)
-  );
+constexpr int NUM_WARPS = 10;
 
-  // Zero out the shared memory buffer.
-  if constexpr (DO_SEND) {
-    // Each tokenIndex[expert] will hold the number of tokens processed for that expert
+using g_pgl = pgl<gl<int, -1, -1, -1, -1>>;
+using g_gl = gl<int, -1, -1, -1, -1>;
+
+using g_buffer = pgl<gl<int, -1, -1, -1, -1>>;
+// using s_vec = sv<bf16, NUM_EXPERTS>;
+
+// 736 * 10 = 7360 => Only first TOKEN DIM elements are used though
+// using tok_rt = rt<float, 16, 46>;
+using tok_rv = rv<int, 736>;
+using tok_sv = sv<int, HIDDEN_DIM_SIZE>;
+
+/*
+Grid size is 132
+*/
+
+struct globals {
+    // expertX: numLocalExperts, maxNumTokens * numDPGroups, perTokenBytes
+    g_gl expertX; // destination array for token data 
+    // g_pgl expertXScale;
+
+    // dpX: numTokens * hiddenDimBytes
+    g_gl dpX; // src array for token data to send off 
+    // g_pgl dpXScale;
+
+    
+    /*
+    numTokensBuffer: numDPGroups, numLocalExperts
+    */
+    g_buffer numTokensBuffer;
+    /*
+    numRecvBuffer: numDPGroups, numLocalExperts
+    */
+    g_buffer numRecvBuffer;
+    /*
+    xBufferOut: 8, 32, 128, TOKEN_DIM
+    xBufferOut: numDPGroups, numLocalExperts, maxNumTokens, perTokenBytes
+    */
+    g_buffer xBufferOut;
+    
+    
+    int32_t *outNumTokensPerExpert; // ensure this is zero'd out before calling t
+    // inidices is m * numExpertsPerToken
+    // Reasonable to load into a r
+    uint32_t *indices;
+    uint32_t *numTokensPerDP; // make non pgl
+
+    // uint32_t *sourceExpert;
+    // uint32_t *sourceIndex;
+    // uint32_t *sourceOffset;
+    // uint32_t *sourceGroup;
+    
+    size_t maxNumTokens;
+    size_t numExperts;
+    size_t numExpertsPerToken;
+
+    int numTokens; // num tokens cur device needs to send (m from pplx)
+    int dev_idx;
+};
+
+__global__ void dispatch_kernel(const __grid_constant__ globals g) {
+    using everyone = kittens::group<NUM_WARPS>;
+    using send_group = kittens::group<NUM_WARPS - 1>;
+    using recv_group = kittens::group<NUM_WARPS>;
+    const unsigned num_local_experts = NUM_EXPERTS / WORLD_SIZE;
+
+    /*
+    Send Phase
+    */
     extern __shared__ uint32_t tokenIndex[];
-    for (uint32_t i = threadIdx.x; i < numExperts; i += blockDim.x) {
+    for (uint32_t i = threadIdx.x; i < g.numExperts; i += blockDim.x) {
       tokenIndex[i] = 0;
     }
     __syncthreads();
 
-    if (warpId + 1 == NUM_WARPS) { // If last warp
-      // Each block is responsible for some subset of experts... 
-      // The loop then iterates over destination experts that are assigned to this block
-      // The loop jumps by gridDim.x * x to cover all experts in round robin fashion
-      for (unsigned dstExpert = blockIdx.x * dpSize + dpRank; dstExpert < numExperts;
-           dstExpert += gridDim.x * dpSize) {
-        const uint32_t dstRank = dstExpert / numLocalExperts;
-        const uint32_t dstLocalExpert = dstExpert % numLocalExperts;
+    extern __shared__ kittens::alignment_dummy __shm[]; 
+    kittens::shared_allocator al((int*)&__shm[0]);
+    // s_vec &s_v = al.allocate<s_vec>();
+    // everyone::zero(s_v);
+    // everyone::sync(0);
 
-        unsigned count = 0;
+    // Do last warp here so can use "groups" for shared memory loads
+    if (kittens::warpid() == NUM_WARPS - 1) {
+        /*
+        There are 256 experts in total, each device is responsible for 32 experts 
 
-        // Each thread in the warp processes a subset of the total tokens for the current expert
-        // The indices array contains the expert assignments for each token
-        #pragma unroll
-        for (uint32_t i = laneId; i < numTokens * numExpertsPerToken; i += WARP_SIZE) {
-          unsigned expert = __ldg(&indices[i]);
-          if (expert == dstExpert) {
-            count += 1;
-          }
-        }
+        Last warp needs to determine how many tokens each expert is responsible for
+            - To do this, each warp across all devices loop through all 256 experts
+                - Each device (in this scenario) has 132 blocks
 
-        // Perform warp level reduction to get total token count for this expert
-        unsigned numTokensPerExpert = device::warp_sum(count);
-        uint64_t *dstCount = &numTokensBuffer[dstLocalExpert * numDPGroups + dpGroup];
+        Starting g_expert_idx is between 0 and 132:
+            - Block Idx 0 handles expert 0, 132, 
+            ...
+            - Block Idx 124 handles expert 124, 256
+        */
+        for (size_t g_expert_idx = blockIdx.x; g_expert_idx < NUM_EXPERTS; g_expert_idx += gridDim.x) {
+            int dst_gpu = g_expert_idx / num_local_experts;
+            int dst_expert_idx = g_expert_idx % num_local_experts;
 
-        if (laneId == 0) {
-          nvshmemx_signal_op(dstCount, numTokensPerExpert + 1, NVSHMEM_SIGNAL_SET, dstRank);
-        }
-      }
+            int count = 0;
+            
+            /*
+            The loop is looping through all tokens for current device and checking if it 
+            is equal to the global expert
+                - all threads in a block look through all routings given by indices 
+                and if it equals the current expert block is handling, increment count
+            
 
-      // Clear out some buffers.
-      // OPTIONAL: Ensure per-expert output count starts at 0
-      if (blockIdx.x == 0) {
-        for (uint32_t i = laneId; i < numLocalExperts; i += WARP_SIZE) {
-          outNumTokensPerExpert[i] = 0;
-        }
-      }
-    } else {
-      // Send the tokens to the destination ranks through RDMA.
-      const unsigned numGroupWarps = NUM_WARPS - 1;
-      const unsigned numGroupThreads = numGroupWarps * WARP_SIZE;
-      
-      // numTokens here is "m", which is random number between 0 and MAX_NUM_TOKENS
-      for (unsigned i = 0; i < numTokens; i++) {
-        // If the token is assigned to this block, handle it.
-        if (i % (gridDim.x * dpSize) == (blockIdx.x * dpSize + dpRank)) {
-          // Copy the token to the symmetric buffer.
-          // xBufferIn is symmetric input buffer where tokens are staged before sending 
-          std::byte *xInPtr = xBufferIn + i * tokenStride;
-          const int4 *srcX = (int4 *)(dpX + i * dpXStrideElem);
-          const int4 *srcXScale = (int4 *)(dpXScale + i * dpXScaleStrideElem);
-          
-          // Each thread in warp group (NUM_WARPS - 1) copies a slice of tokens data
-          // Loop through token's data in units of int4 until complete tokenDim is copied 
-          // "tokenDim" here is "hiddenDim + hiddenDimScale"
-          for (unsigned d = threadIdx.x; d * sizeof(int4) < tokenDim; d += numGroupThreads) {
-            if (d * sizeof(int4) < hiddenDim) {
-              ((int4 *)xInPtr)[d] = srcX[d];
-            } else {
-              ((int4 *)xInPtr)[d] = srcXScale[d - hiddenDim / sizeof(int4)];
+            How do we make this kittens? 
+            - load all of indices into an rt of equivalent size
+            - want to create tile then that is all zero's unless is equal to dst_expert_idx
+            - then 
+            - some sort of shared buffer 
+
+            how are we going to 
+            - Would be nice if we can just reduce add and send... how can we reduce add to correct 
+            location 
+            - how large of a tile would that be? 
+
+            have tile that represents all experts => JUST 256
+            have local register tile of 256 => keep local count, logic, and then atomic add RT to 
+
+            want to use kittens load functions to optimize loads? 
+
+            
+            */
+            #pragma unroll
+            for (int i = laneid(); i < g.numTokens * g.numExpertsPerToken; i += WARP_THREADS) {
+                int expert = __ldg(&g.indices[i]);
+                if (expert == dst_expert_idx) count++;
             }
-          }
-          
-          // Have one thread (thread 0) store the token index in the symmetric buffer.
-          // This index is later used to track where the token originated.
-          if (threadIdx.x == 0) {
-            *((uint32_t *)(xInPtr + tokenDim)) = i;
-          }
+            
+            count += __shfl_xor_sync(0xffffffff, count, 16);
+            count += __shfl_xor_sync(0xffffffff, count, 8);
+            count += __shfl_xor_sync(0xffffffff, count, 4);
+            count += __shfl_xor_sync(0xffffffff, count, 2);
+            count += __shfl_xor_sync(0xffffffff, count, 1);
+        
+            if (laneid() == 0) {
+                // g.numTokensBuffer.mc_vas[g.dev_idx][dst_expert_idx] = count + 1;
+                // Could be faster to just store directly instead of multimem here => test difference
+                // asm volatile ("{multimem.red.release.sys.global.add.u32 [%0], %1;}" 
+                //     :: "l"(g.numTokensBuffer.mc_vas[g.dev_idx][dst_expert_idx]), "n"(count + 1) : "memory");
+                // unsigned int value = count + 1;
+                // asm volatile ("{multimem.red.release.sys.global.add.u32 [%0], %1;}" 
+                //     :: "l"((unsigned long long)(g.numTokensBuffer.mc_vas[g.dev_idx][dst_expert_idx])), 
+                //       "r"(value) : "memory");
+                asm volatile ("{multimem.red.release.sys.global.add.u32 [%0], %1;}" 
+                  :: "l"(&(g.numTokensBuffer.mc_vas[g.dev_idx][dst_expert_idx])), 
+                     "r"(count + 1) : "memory");
+            }
+        }
+    } else {
+        for (int i = 0; i < g.numTokens; ++i) {
+            // Each block handles a different token
+            // In example, max numTokens is 128 so only 128 / 132 blocks will be active
+            if (i % gridDim.x == blockIdx.x) {
+                /*
+                Here, we want to take data from dpX which is the local token data
+                currently on device and place it into xBufferOut 
 
-          // Synchronize the warps within this warp group => Ensure copy is completed
-          asm volatile("bar.sync 1, %0;" ::"r"(numGroupThreads));
+                Need to send both dpX and dpXScale to the expert
 
-          // Send the token to the other ranks, one send per warp.
-          // Each warp in the warp group sends the token based on a subset of destination assignments
-          for (unsigned j = warpId; j < numExpertsPerToken; j += numGroupWarps) {
-            // Load destionation expert for this token 
-            const uint32_t dstExpert = __ldg(&indices[i * numExpertsPerToken + j]);
-            // Compute which GPU the token is being sent to
-            const uint32_t dstRank = dstExpert / numLocalExperts;
-            const uint32_t dstLocalExpert = dstExpert % numLocalExperts;
+                dpX is hiddenDim size (7168)
+                dpXScale is hiddenDimScale (7168 / 128) => 56
+                    - dpXScale is hiddenDimScale (7168 / 112) => 64
 
-            // Retrieve current count of tokens sent to this expert
-            const uint32_t index = tokenIndex[dstExpert];
-            // group = dstLocalExpert * 1 + rank
-            const uint32_t group = dstLocalExpert * numDPGroups + dpGroup;
-            // Compute destination slot within remote's buffer
-            // Each group has a fixed capacity (maxNumTokens) 
-            const unsigned loc = group * maxNumTokens + index;
+                Have 10 Warps to load => Just load straight to shared memory
 
-            std::byte *destPointer = xBufferOut + loc * tokenStride;
-            nvshmemx_putmem_signal_nbi_warp(
-                destPointer,
-                xInPtr,
-                tokenStride,
-                &numRecvBuffer[group],
-                1,
-                NVSHMEM_SIGNAL_ADD,
-                dstRank // Where token should be sent
-            );
-          }
+                Use TMA here eventually??
+                */
+                tok_sv &tok_dst_data = al.allocate<tok_sv>();
+                send_group::load(tok_dst_data, g.dpX, {i});
+                send_group::sync(0);
+
+                for (int j = 0; j < g.numExpertsPerToken; ++j) {
+                    int dst_expert = __ldg(&g.indices[i * g.numExpertsPerToken + j]);
+                    int dst_gpu = dst_expert / num_local_experts;
+                    int dst_expert_idx = dst_expert % num_local_experts;
+                    
+                    // Get the number of tokens that have currently been sent to the expert
+                    int index = tokenIndex[dst_expert];
+
+                    // Experiment with just using store here??
+                    send_group::broadcast(g.xBufferOut, tok_dst_data, g.dev_idx, 
+                        {g.dev_idx, dst_expert_idx, index, 0});
+                    if (warpid() == 0 && laneid() == 0) {
+                        asm volatile ("{multimem.red.release.sys.global.add.u32 [%0], %1;}" 
+                            :: "l"(&(g.numRecvBuffer.mc_vas[g.dev_idx][dst_expert_idx])), "n"(1) : "memory");
+                    }
+                }
+
+                // Replicate token count across all blocks
+                if (warpid() == 0 && laneid() < g.numExpertsPerToken) {
+                    int dst_expert = __ldg(&g.indices[i * g.numExpertsPerToken + laneid()]);
+                    tokenIndex[dst_expert]++;
+                }
+            }
+
+
         }
 
-        // Replicate the token count calculation across all blocks.
-        // Need to update this such that for future tokens, can index into correct location
-        // in xBufferOut
-        if (warpId == 0 && laneId < numExpertsPerToken) {
-          uint32_t dstExpert = __ldg(&indices[i * numExpertsPerToken + laneId]);
-          tokenIndex[dstExpert]++;
-        }
-      }
+
     }
-  }
 
-  if constexpr (DO_RECV) {
-    // Wait for the token counts to be sent.
-    for (unsigned expertAndGroup = blockIdx.x * blockDim.x + threadIdx.x;
-         expertAndGroup < numLocalExperts * numDPGroups;
-         expertAndGroup += blockDim.x * gridDim.x) {
-      const uint32_t srcDpGroup = expertAndGroup % numDPGroups;
-      const uint32_t srcLocalExpert = expertAndGroup / numDPGroups;
-      const size_t slot = srcLocalExpert * numDPGroups + srcDpGroup;
-
-      // Fetch the token count per DP, which is non-zero to indicate receipt.
-      // Afterwards, wait for exactly that many tokens to be sent to us.
-      nvshmem_uint64_wait_until(&numTokensBuffer[slot], NVSHMEM_CMP_NE, 0);
-      size_t numTokens = numTokensBuffer[slot] - 1;
-      nvshmem_uint64_wait_until(&numRecvBuffer[slot], NVSHMEM_CMP_EQ, numTokens);
-
-      // Store the token count locally.
-      numTokensPerDP[slot] = numTokens;
-      atomicAdd(&outNumTokensPerExpert[srcLocalExpert], numTokens);
-
-      // Clean the buffers.
-      numTokensBuffer[slot] = 0;
-      numRecvBuffer[slot] = 0;
+    /*
+    Receive Phase
+    */
+    /*
+    first 32 threads of device stall untill device receives all tokens expected
+    */
+    for (size_t expert = blockIdx.x * blockDim.x + threadIdx.x;
+         expert < num_local_experts; expert += blockDim.x * gridDim.x) {
+        int src_local_expert = expert / WORLD_SIZE;
+        // Stall until numTokensBuffer is updated 
+        while (g.numTokensBuffer[g.dev_idx].raw_ptr[src_local_expert] == 0);
+        size_t numTokens = g.numTokensBuffer[g.dev_idx].raw_ptr[src_local_expert] - 1;
+        // Stall here until we know that all tokens have been received
+        while (g.numRecvBuffer[g.dev_idx].raw_ptr[src_local_expert] < numTokens);
+        
+        int src_gpu = expert % WORLD_SIZE;
+        int slot = src_local_expert * WORLD_SIZE + src_gpu;
+        g.numTokensPerDP[slot] = numTokens;
+        atomicAdd(&g.outNumTokensPerExpert[src_local_expert], numTokens);
+        
+        g.numTokensBuffer[g.dev_idx].raw_ptr[src_local_expert] = 0;
+        g.numRecvBuffer[g.dev_idx].raw_ptr[src_local_expert] = 0;
     }
+    
     cg::this_grid().sync();
+    int expert = 0;
+    int device = 0;
+    int offset = 0;
+    int start = 0;
+    int max_batch_tokens = num_local_experts * WORLD_SIZE * g.maxNumTokens;
 
-    // Copy the tokens from the symmetric buffer to the output buffer.
-    unsigned expert = 0;
-    unsigned dp = 0;
-    unsigned offset = 0;
-    unsigned start = 0;
-    const uint32_t maxBatchTokens = numLocalExperts * numDPGroups * maxNumTokens;
-    for (uint32_t token = blockIdx.x; token < maxBatchTokens; token += gridDim.x) {
-      // Find the expert, DP group and index for this token.
-      unsigned j = token - offset;
-      while (offset + __ldg(&numTokensPerDP[expert * numDPGroups + dp]) <= token) {
-        offset += __ldg(&numTokensPerDP[expert * numDPGroups + dp]);
-        j = token - offset;
-        if (++dp == numDPGroups) {
-          dp = 0;
-          start = offset;
-          if (++expert == numLocalExperts) {
+    /*
+    Each block handles it's own token
+    */
+    for (int token = blockIdx.x; token < max_batch_tokens; token += gridDim.x) {
+        int j = token - offset;
+        while (offset + __ldg(&g.numTokensPerDP[expert * WORLD_SIZE + device]) <= token) {
+            // Since current token not in current group, add number of tokens in group to offset
+            offset += __ldg(&g.numTokensPerDP[expert * WORLD_SIZE + device]);
+            j = token - offset;
+            if (++device == WORLD_SIZE) {
+                device = 0;
+                start = offset;
+                if (++expert == num_local_experts) {
+                break;
+                }
+            }
+            }
+            if (expert >= num_local_experts) {
             break;
-          }
-        }
-      }
-      if (expert >= numLocalExperts) {
-        break;
-      }
+            }
 
-      // Copy the token to the output buffer.
-      const uint32_t group = expert * numDPGroups + dp;
-      const std::byte *xTokenBuffer =
-          (const std::byte *)xBufferOut + (group * maxNumTokens + j) * tokenStride;
+            // Copy the token to the output buffer.
+            int group = expert * WORLD_SIZE + device;
+            int loc = token - start;
 
-      const unsigned loc = token - start;
-      const int4 *srcX = (int4 *)xTokenBuffer;
-      int4 *dstX = (int4 *)(expertX + expert * expertXStrideRow + loc * expertXStrideElem);
-      int4 *dstXScale =
-          (int4 *)(expertXScale + expert * expertXScaleStrideRow + loc * expertXScaleStrideElem);
-      for (unsigned k = threadIdx.x; k * sizeof(int4) < tokenDim; k += blockDim.x) {
-        if (k * sizeof(int4) < hiddenDim) {
-          dstX[k] = srcX[k];
-        } else {
-          dstXScale[k - hiddenDim / sizeof(int4)] = srcX[k];
-        }
-      }
-
-      if (threadIdx.x == 0) {
-        sourceIndex[token] = *((uint32_t *)(xTokenBuffer + tokenDim));
-        sourceExpert[token] = expert + 1;
-        sourceOffset[token] = loc;
-        sourceGroup[token] = dp;
-      }
+            tok_sv &tok_data = al.allocate<tok_sv>();
+            
+            // recv_group::load(tok_data, g.xBufferOut)
+            recv_group::sync(0);
+            recv_group::store(g.expertX, tok_data, {expert, loc});
     }
-  }
 }
 
 void AllToAllInterNode::dispatch(
@@ -284,83 +306,62 @@ void AllToAllInterNode::dispatch(
     SplitMode splitMode,
     cudaStream_t stream
 ) {
-  constexpr unsigned NUM_WARPS = 10;
-  const unsigned numBlocks = std::min(
-      std::max(
-          ceil_div<unsigned>(numExperts, NUM_WARPS), (unsigned)(maxNumTokens * expertsPerToken)
-      ),
-      132u
-  );
-  dim3 dimGrid(numBlocks, 1, 1);
-  dim3 dimBlock(NUM_WARPS * 32, 1, 1);
+    CUCHECK(cuInit(0));
+    int device_ids[WORLD_SIZE];
+    for (int i = 0; i < WORLD_SIZE; ++i) device_ids[i] = i;
+    KittensClub club(device_ids, WORLD_SIZE);
 
-  void *args[] = {
-      const_cast<int32_t **>(&outNumTokensPerExpert.data),
-      const_cast<size_t *>(&outNumTokensPerExpert.strideElem),
-      const_cast<std::byte **>(&expertX.data),
-      const_cast<size_t *>(&expertX.strideElem),
-      const_cast<size_t *>(&expertX.strideRow),
-      const_cast<std::byte **>(&expertXScale.data),
-      const_cast<size_t *>(&expertXScale.strideElem),
-      const_cast<size_t *>(&expertXScale.strideRow),
-      const_cast<std::byte **>(&dpX.data),
-      const_cast<size_t *>(&dpX.strideElem),
-      const_cast<std::byte **>(&dpXScale.data),
-      const_cast<size_t *>(&dpXScale.strideElem),
-      const_cast<uint32_t **>(&indices.data),
-      const_cast<size_t *>(&indices.strideElem),
-      const_cast<size_t *>(&indices.strideRow),
-      const_cast<size_t *>(&maxNumTokens),
-      const_cast<size_t *>(&numExperts),
-      const_cast<unsigned *>(&rank),
-      const_cast<unsigned *>(&worldSize),
-      const_cast<unsigned *>(&dpSize),
-      const_cast<size_t *>(&hiddenDimBytes),
-      const_cast<size_t *>(&hiddenDimScaleBytes),
-      const_cast<size_t *>(&expertsPerToken),
-      const_cast<unsigned **>(&boundM),
-      &m,
-      &numTokensPerDP,
-      &sourceExpert,
-      &sourceIndex,
-      &sourceOffset,
-      &sourceGroup,
-      &numTokensBuffer,
-      &numDispatchRecvBuffer,
-      &xDispatchIn,
-      &xDispatchOut,
-  };
+    unsigned long smem_size = kittens::MAX_SHARED_MEMORY - 1024; // MAX_SHARED_MEMORY = 227KB for Hopper
+    club.execute([smem_size](int dev_idx) {
+        CUDACHECK(cudaFuncSetAttribute(dispatch_kernel,
+                                        cudaFuncAttributeMaxDynamicSharedMemorySize, 
+                                        smem_size));
+    });
 
-  nvtxRangePush("dispatch");
-  switch (splitMode) {
-  case SplitMode::SEND:
-    CUDACHECK(cudaLaunchKernel(
-        (void *)&dispatchKernel<NUM_WARPS, true, false>,
-        dimGrid,
-        dimBlock,
-        args,
-        sizeof(uint32_t) * numExperts,
-        stream
-    ));
-    break;
-  case SplitMode::RECV:
-    CUDACHECK(cudaLaunchCooperativeKernel(
-        (void *)&dispatchKernel<NUM_WARPS, false, true>, dimGrid, dimBlock, args, 0, stream
-    ));
-    break;
-  case SplitMode::NONE:
-    CUDACHECK(cudaLaunchCooperativeKernel(
-        (void *)&dispatchKernel<NUM_WARPS, true, true>,
-        dimGrid,
-        dimBlock,
-        args,
-        sizeof(uint32_t) * numExperts,
-        stream
-    ));
-    break;
-  default:
-    ROSE_UNREACHABLE("invalid split mode");
-  }
-  nvtxRangePop();
+    constexpr unsigned NUM_WARPS = 10;
+    const unsigned numBlocks = std::min( // min( max((256 / 10), (128 * 8)), 132) = 132
+        std::max(
+            ceil_div<unsigned>(numExperts, NUM_WARPS), (unsigned)(maxNumTokens * expertsPerToken)
+        ),
+        132u
+    );
+    
+    dim3 dimGrid(numBlocks, 1, 1);
+    dim3 dimBlock(NUM_WARPS * 32, 1, 1);
+
+
+    uint32_t **device_num_tokens_ptrs = new uint32_t*[WORLD_SIZE];
+    size_t num_tokens_size = WORLD_SIZE * (NUM_EXPERTS / WORLD_SIZE) * sizeof(uint32_t);
+
+    uint32_t **device_num_recv_ptrs = new uint32_t*[WORLD_SIZE];
+    size_t num_recv_size = WORLD_SIZE * (NUM_EXPERTS / WORLD_SIZE) * sizeof(uint32_t);
+
+    uint32_t **device_num_x_buffer_ptrs = new uint32_t*[WORLD_SIZE];
+    size_t num_x_buffer_size = WORLD_SIZE * (NUM_EXPERTS / WORLD_SIZE) * sizeof(uint32_t);
+    for (int dev_idx = 0; dev_idx < WORLD_SIZE; ++dev_idx) {
+        pglCudaMalloc<true>(WORLD_SIZE, device_ids, dev_idx, &device_num_tokens_ptrs[dev_idx], num_tokens_size);
+        pglCudaMalloc<true>(WORLD_SIZE, device_ids, dev_idx, &device_num_recv_ptrs[dev_idx], num_recv_size);
+        pglCudaMalloc<true>(WORLD_SIZE, device_ids, dev_idx, &device_num_x_buffer_ptrs[dev_idx], num_x_buffer_size);
+    }
+
+    // This is more than needed => Can optimize
+    g_gl dpX_gl{expertX.data, 1, 1, maxNumTokens, hiddenDimBytes}
+    g_gl expertX_gl{expertX.data, 1, outNumTokensPerExpert.data, maxNumTokens * WORLD_SIZE, hiddenDimBytes}
+    
+    globals G(
+        outNumTokensPerExpert.data,
+        expertX_gl,
+        dpX_gl,
+        
+
+    );
+
+    club.execute([&](int dev_idx) { // warmup
+        dispatch_kernel<<<dimGrid, dimBlock, kittens::MAX_SHARED_MEMORY - 1024>>>(sm, dev_idx);
+        CUDACHECK(cudaDeviceSynchronize());
+    });
+
+  
 }
+
 

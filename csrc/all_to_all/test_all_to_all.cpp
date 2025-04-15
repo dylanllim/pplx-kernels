@@ -1,5 +1,3 @@
-test_all_to_all.cpp
-
 // All-to-all kernel test
 
 #include <cuda.h>

@@ -1,5 +1,3 @@
-test_utils.h
-
 #pragma once
 
 #include "core/buffer.h"
@@ -55,6 +53,11 @@ RankTestData<T>::RankTestData(
       expertsPerToken(expertsPerToken),
       x(m * hiddenDim),
       xScale(m * hiddenDimScale),
+
+      /*
+      indices is m * expertsPerToken as the total number of assignments we 
+      have is 8 routes for each token 
+      */
       indices(m * expertsPerToken),
       weights(m * expertsPerToken),
       numRouted(numExperts) {

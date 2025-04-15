@@ -61,6 +61,7 @@ std::pair<Time, Time> benchmark(
 
   const unsigned expertsPerRank = config.numExperts / numPEs;
   DeviceBuffer<int32_t> outTokensPerExpertDevice(expertsPerRank);
+  // 32 * 128 * 8 * 7168
   DeviceBuffer<T> outExpertDevice(expertsPerRank * config.numTokens * numPEs * config.hiddenDim);
   DeviceBuffer<float> outExpertScaleDevice(
       expertsPerRank * config.numTokens * numPEs * data.hiddenDimScale
@@ -109,7 +110,7 @@ std::pair<Time, Time> benchmark(
 
       allToAll.dispatch(
           Strided1D<int32_t>(outTokensPerExpertDevice, 1),
-          Strided2D<std::byte>(
+          Strided2D<std::byte>( // 7168, 7168 * 128 * 8
               outExpertDevice, hiddenDimBytes, hiddenDimBytes * config.numTokens * numPEs
           ),
           Strided2D<std::byte>(
